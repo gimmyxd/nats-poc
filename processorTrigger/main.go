@@ -10,7 +10,10 @@ import (
 )
 
 type ProcessorMessage struct {
-	Time time.Time
+	Time     time.Time
+	FirstSeq uint64
+	LastSeq  uint64
+	Count    uint64
 }
 
 func main() {
@@ -22,32 +25,51 @@ func main() {
 	}
 
 	for {
-		timestamp := time.Now().Add(-30 * time.Second)
-		triggerFlush(js, "tenant1", timestamp)
-		time.Sleep(time.Since(timestamp))
-		timestamp = time.Now().Add(-30 * time.Second)
-		triggerFlush(js, "tenant2", timestamp)
+		triggerFlush(js, "tenant1")
+		time.Sleep(30 * time.Second)
+		triggerFlush(js, "tenant2")
+		time.Sleep(30 * time.Second)
 	}
 }
 
-func triggerFlush(js nats.JetStreamContext, tenantId string, timestamp time.Time) {
+func triggerFlush(js nats.JetStreamContext, tenantId string) {
+	tenantStream := getTenantStreamInfo(tenantId, js)
+
 	stream := "processor"
 	streamSubject := "flush.*"
 	streamSubjectMsg := fmt.Sprintf("flush.%s", tenantId)
-	log.Printf("\n\n\n FLUSHING: %s %s %s\n\n\n", stream, streamSubjectMsg, timestamp.UTC())
 
 	createStream(js, stream, streamSubject)
+
+	timestamp := time.Now()
+	remaining := tenantStream.State.Msgs
+	firstSeq := tenantStream.State.FirstSeq
+	lastSeq := tenantStream.State.LastSeq
+
+	log.Printf("[%s]: remaining: %d, firstSeq: %d, lastSeq: %d\n", tenantId, remaining, firstSeq, lastSeq)
+
 	processMessage := ProcessorMessage{
-		Time: timestamp,
+		Time:     timestamp,
+		FirstSeq: firstSeq,
+		LastSeq:  lastSeq,
+		Count:    remaining,
 	}
 
 	buf, err := json.Marshal(processMessage)
 	checkErr(err)
-	checkErr(err)
 
 	_, err = js.Publish(streamSubjectMsg, buf, nats.ExpectStream(stream))
-	log.Printf("published: %s\n", streamSubjectMsg)
+	log.Printf("[%s]: flusing: %s %s %s\n", tenantId, stream, streamSubjectMsg, timestamp.UTC())
 	checkErr(err)
+}
+
+func getTenantStreamInfo(tenantId string, js nats.JetStreamContext) *nats.StreamInfo {
+	streamName := fmt.Sprintf("ems-v2-%s", tenantId)
+
+	stream, err := js.StreamInfo(streamName)
+	checkErr(err)
+
+	return stream
 }
 
 func createStream(js nats.JetStreamContext, streamName string, streamSubjects string) (*nats.StreamInfo, error) {
@@ -59,8 +81,9 @@ func createStream(js nats.JetStreamContext, streamName string, streamSubjects st
 	if stream == nil {
 		log.Printf("creating stream %q and subjects %q \n", streamName, streamSubjects)
 		_, err = js.AddStream(&nats.StreamConfig{
-			Name:     streamName,
-			Subjects: []string{streamSubjects},
+			Name:      streamName,
+			Retention: nats.WorkQueuePolicy,
+			Subjects:  []string{streamSubjects},
 		})
 		if err != nil {
 			return nil, err

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,13 +11,15 @@ import (
 
 	"github.com/aserto-dev/go-authorizer/aserto/authorizer/v2/api"
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/proto"
 )
 
 type ProcessorMessage struct {
-	Time time.Time
+	Time     time.Time
+	FirstSeq uint64
+	LastSeq  uint64
+	Count    uint64
 }
 
 func main() {
@@ -28,74 +29,68 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ctx, _ := context.WithTimeout(context.Background(), 1000*time.Second)
-
-	jsx, err := jetstream.New(nc)
 	checkErr(err)
 
 	_, err = js.StreamInfo("processor")
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Create durable consumer monitor
+	// Create durable consumer processor
 	js.Subscribe("flush.*", func(msg *nats.Msg) {
 		msg.Ack()
 		var processMessage ProcessorMessage
 		err := json.Unmarshal(msg.Data, &processMessage)
 		checkErr(err)
 
-		log.Printf("processMessage: %v", processMessage)
-
 		tenantId := strings.Split(msg.Subject, ".")[1]
-		log.Printf("processing :%s\n", tenantId)
-		flushEvents(ctx, jsx, tenantId, processMessage)
-	}, nats.Durable("monitor"), nats.ManualAck())
-
-	// defer cancel()
+		log.Printf("[%s]: processing\n", tenantId)
+		flushEvents(js, tenantId, processMessage)
+	}, nats.Durable("processor"), nats.ManualAck())
 
 	runtime.Goexit()
 }
 
-func flushEvents(ctx context.Context, js jetstream.JetStream, tenantId string, processMessage ProcessorMessage) {
-	log.Printf("flusing events for: %s\n", tenantId)
+func flushEvents(js nats.JetStreamContext, tenantId string, processMessage ProcessorMessage) {
+	log.Printf("[%s]: flusing events", tenantId)
 
 	streamName := fmt.Sprintf("ems-v2-%s", tenantId)
 
-	stream, err := js.Stream(ctx, streamName)
-	checkErr(err)
+	remaining := processMessage.Count
+	firstSeq := processMessage.FirstSeq
+	lastSeq := processMessage.LastSeq
+	log.Printf("[%s]: remaining: %d, firstSeq: %d, lastSeq: %d\n", tenantId, remaining, firstSeq, lastSeq)
 
-	remaining := stream.CachedInfo().State.Msgs
-	log.Printf("remaining: %d\n", remaining)
-
-	dur, err := js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
-		Durable:       streamName,
-		OptStartTime:  &processMessage.Time,
-		DeliverPolicy: jetstream.DeliverByStartTimePolicy,
-	})
+	dur, err := js.PullSubscribe(fmt.Sprintf("%s.v2.decisions.*.*", tenantId), streamName,
+		nats.StartSequence(firstSeq),
+	)
 
 	checkErr(errors.Wrap(err, "failed to create durable stream"))
 
-	var seq jetstream.SequencePair
-	fetchResult, _ := dur.Fetch(100, jetstream.FetchMaxWait(100*time.Millisecond))
-	for msg := range fetchResult.Messages() {
-		msg.Ack()
-		// data := msg.Subject()
-		var decision api.Decision
-		err := proto.Unmarshal(msg.Data(), &decision)
+	if remaining > 0 {
+		fetchResult, err := dur.Fetch(int(remaining), nats.MaxWait((100 * time.Millisecond)))
 		checkErr(err)
-
-		meta, err := msg.Metadata()
-		checkErr(err)
-		seq = meta.Sequence
-		writeEventsToFile(&decision, tenantId, processMessage.Time)
+		for _, msg := range fetchResult {
+			msg.Ack()
+			var decision api.Decision
+			err := proto.Unmarshal(msg.Data, &decision)
+			checkErr(err)
+			meta, err := msg.Metadata()
+			checkErr(err)
+			if meta.NumPending != 0 {
+				writeEventsToFile(&decision, tenantId, processMessage.Time)
+			}
+		}
 	}
 
-	log.Printf("seq: %v", seq)
-	purgeOpts := []jetstream.StreamPurgeOpt{jetstream.WithPurgeSubject(fmt.Sprintf("%s.v2.decisions.*.*", tenantId)), jetstream.WithPurgeSequence(seq.Stream)}
+	log.Printf("[%s]: purging to: %v", tenantId, lastSeq)
 
-	stream.Purge(ctx, purgeOpts...)
+	js.PurgeStream(streamName, &nats.StreamPurgeRequest{
+		Sequence: lastSeq,
+		Keep:     0,
+		Subject:  fmt.Sprintf("%s.v2.decisions.*.*", tenantId),
+	})
 
-	stream.DeleteConsumer(ctx, streamName)
+	js.DeleteConsumer(streamName, streamName)
 }
 
 // writeEventsToFile reviews the event and publishes EVENTS.approved event
@@ -116,7 +111,6 @@ func writeEventsToFile(decision *api.Decision, tenantId string, time time.Time) 
 
 	_, err = f.WriteString("\n")
 	checkErr(err)
-	// log.Printf("done writing events to [%s]", file)
 }
 
 func checkErr(err error) {

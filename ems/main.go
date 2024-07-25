@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -36,45 +35,16 @@ func main() {
 
 	start := 0
 	for {
-		// timestamp := time.Now()
 
 		log.Printf("Creating next batch of decisions: [%d] for [%s]\n", start, tenantId1)
 		err = createDecision(js, start, tenantId1)
 		checkErr(err)
-		// start += 10
 		log.Printf("Creating next batch of decisions: [%d] for [%s]", start, tenantId2)
 		err = createDecision(js, start, tenantId2)
 		checkErr(err)
 		start += 10
-		time.Sleep(5 * time.Second)
-		// triggerFlush(js, tenantId1, timestamp)
-		// err = createDecision(js, start, tenantId1)
-		// checkErr(err)
-		// start += 10
-		// time.Sleep(5 * time.Second)
-		// triggerFlush(js, tenantId2)
-		// time.Sleep(5 * time.Second)
+		time.Sleep(1 * time.Second)
 	}
-}
-
-func triggerFlush(js nats.JetStreamContext, tenantId string, timestamp time.Time) {
-	stream := "processor"
-	streamSubject := "flush.*"
-	streamSubjectMsg := fmt.Sprintf("flush.%s", tenantId)
-	log.Printf("\n\n\n FLUSHING: %s %s %s\n\n\n", stream, streamSubjectMsg, timestamp.UTC())
-
-	createStream(js, stream, streamSubject)
-	processMessage := ProcessorMessage{
-		Time: timestamp,
-	}
-
-	buf, err := json.Marshal(processMessage)
-	checkErr(err)
-	checkErr(err)
-
-	_, err = js.Publish(streamSubjectMsg, buf, nats.ExpectStream(stream))
-	log.Printf("published: %s\n", streamSubjectMsg)
-	checkErr(err)
 }
 
 // createDecision publishes stream of decisions
@@ -111,7 +81,7 @@ func createDecision(js nats.JetStreamContext, start int, tenantId string) error 
 
 			_, err = js.Publish(msgSubject, buf, nats.MsgId(decision.Id), nats.ExpectStream(stream))
 			checkErr(err)
-			time.Sleep(1 * time.Second)
+			time.Sleep(400 * time.Millisecond)
 		}
 	}
 	return nil
